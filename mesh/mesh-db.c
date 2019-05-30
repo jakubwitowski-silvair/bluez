@@ -373,39 +373,48 @@ bool mesh_db_read_app_keys(json_object *jobj, mesh_db_app_key_cb cb,
 bool mesh_db_read_net_keys(json_object *jobj, mesh_db_net_key_cb cb,
 								void *user_data)
 {
-	json_object *jarray;
-	int len;
-	int i;
+	json_object *jobject;
+	struct json_object_iterator iter, end;
+	const char *jidx;
+	json_object *jtemp, *jvalue;
 
 	if (!cb)
 		return true;
 
-	if (!json_object_object_get_ex(jobj, "netKeys", &jarray))
+	if (!json_object_object_get_ex(jobj, "netKeys", &jobject))
+		return true;
+
+	if (json_object_get_type(jobject) != json_type_object)
 		return false;
 
-	if (json_object_get_type(jarray) != json_type_array)
-		return false;
+	iter = json_object_iter_begin(jobject);
+	end = json_object_iter_end(jobject);
 
-	len = json_object_array_length(jarray);
+	while (!json_object_iter_equal(&iter, &end)) {
 
-	for (i = 0; i < len; ++i) {
-		json_object *jtemp, *jvalue;
 		int idx;
-		char *str;
+		char *str, *end;
 		bool key_refresh = false;
 		int phase;
 		uint8_t key[16];
 		uint8_t new_key[16];
 
-		jtemp = json_object_array_get_idx(jarray, i);
+		jidx = json_object_iter_peek_name(&iter);
+		jtemp = json_object_iter_peek_value(&iter);
 
-		if (!get_int(jtemp, "index", &idx))
+		if (!*jidx)
 			return false;
 
-		if (!CHECK_KEY_IDX_RANGE(idx))
+		idx = (int)strtol(jidx, &end, 10);
+		if (*end || !CHECK_KEY_IDX_RANGE(idx))
 			return false;
 
-		if (json_object_object_get_ex(jtemp, "oldKey", &jvalue)) {
+		if (json_object_get_type(jtemp) != json_type_object)
+			return false;
+
+		json_object_object_get_ex(jtemp, "oldKey", &jvalue);
+
+		if (jvalue) {
 			str = (char *)json_object_get_string(jvalue);
 			if (!str2hex(str, strlen(str), key, 16))
 				return false;
@@ -419,7 +428,9 @@ bool mesh_db_read_net_keys(json_object *jobj, mesh_db_net_key_cb cb,
 		if (!str2hex(str, strlen(str), key_refresh ? new_key : key, 16))
 			return false;
 
-		if (!json_object_object_get_ex(jtemp, "keyRefresh", &jvalue))
+		json_object_object_get_ex(jtemp, "keyRefresh", &jvalue);
+
+		if (!jvalue)
 			phase = KEY_REFRESH_PHASE_NONE;
 		else
 			phase = json_object_get_int(jvalue);
@@ -428,51 +439,45 @@ bool mesh_db_read_net_keys(json_object *jobj, mesh_db_net_key_cb cb,
 		if (!cb((uint16_t)idx, key, key_refresh ? new_key : NULL, phase,
 								user_data))
 			return false;
+
+		json_object_iter_next(&iter);
 	}
 
 	return true;
 }
 
 bool mesh_db_net_key_add(json_object *jobj, uint16_t idx,
-							const uint8_t key[16])
+		const uint8_t key[16])
 {
-	json_object *jarray = NULL, *jentry = NULL, *jstring;
-	char buf[5];
+	json_object *jobject, *jentry = NULL, *jvalue = NULL;
+	char int_as_str[6];
 
-	json_object_object_get_ex(jobj, "netKeys", &jarray);
-	if (jarray)
-		jentry = get_key_object(jarray, idx);
+	json_object_object_get_ex(jobj, "netKeys", &jobject);
 
-	/* Do not allow direct overwrite */
-	if (jentry)
-		return false;
+	if (!jobject) {
+		jobject = json_object_new_object();
+
+		if (!jobject)
+			return false;
+
+		json_object_object_add(jobj, "netKeys", jobject);
+	}
 
 	jentry = json_object_new_object();
 	if (!jentry)
-		return false;
-
-	snprintf(buf, 5, "%4.4x", idx);
-	jstring = json_object_new_string(buf);
-	if (!jstring)
 		goto fail;
 
-	json_object_object_add(jentry, "index", jstring);
+	jvalue = json_object_new_int(KEY_REFRESH_PHASE_NONE);
+	if (!jvalue)
+		goto fail;
+
+	json_object_object_add(jentry, "keyRefresh", jvalue);
 
 	if (!add_key_value(jentry, "key", key))
 		goto fail;
 
-	json_object_object_add(jentry, "keyRefresh",
-				json_object_new_int(KEY_REFRESH_PHASE_NONE));
-
-	if (!jarray) {
-		jarray = json_object_new_array();
-		if (!jarray)
-			goto fail;
-		json_object_object_add(jobj, "netKeys", jarray);
-	}
-
-	json_object_array_add(jarray, jentry);
-
+	snprintf(int_as_str, sizeof(int_as_str), "%hd", idx);
+	json_object_object_add(jobject, int_as_str, jentry);
 	return true;
 fail:
 	if (jentry)
@@ -514,32 +519,20 @@ bool mesh_db_net_key_update(json_object *jobj, uint16_t idx,
 
 bool mesh_db_net_key_del(json_object *jobj, uint16_t idx)
 {
-	json_object *jarray, *jarray_new;
+	json_object *jobject;
+	char int_as_str[6];
 
-	if (!json_object_object_get_ex(jobj, "netKeys", &jarray))
+	json_object_object_get_ex(jobj, "netKeys", &jobject);
+	if (!jobject)
 		return true;
 
-	/* Check if matching entry exists */
-	if (!get_key_object(jarray, idx))
-		return true;
-
-	if (json_object_array_length(jarray) == 1) {
+	if (json_object_get_object(jobject)->size == 1) {
 		json_object_object_del(jobj, "netKeys");
 		return true;
 	}
 
-	/*
-	 * There is no easy way to delete a value from json array.
-	 * Create a new copy without specified element and
-	 * then remove old array.
-	 */
-	jarray_new = jarray_key_del(jarray, idx);
-	if (!jarray_new)
-		return false;
-
-	json_object_object_del(jobj, "netKeys");
-	json_object_object_add(jobj, "netKeys", jarray_new);
-
+	snprintf(int_as_str, sizeof(int_as_str), "%hd", idx);
+	json_object_object_del(jobject, int_as_str);
 	return true;
 }
 
